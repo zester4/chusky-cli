@@ -1,6 +1,6 @@
 {
   "name": "@chusky/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Official terminal client for Chusky",
   "license": "MIT",
   "repository": {
@@ -15,8 +15,15 @@
   "bin": {
     "chusky": "dist/cli.js"
   },
-  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
-  "engines": { "node": ">=18" },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
