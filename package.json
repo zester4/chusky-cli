@@ -1,6 +1,6 @@
 {
   "name": "@chusky/cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Official terminal client for Chusky",
   "license": "MIT",
   "repository": {
