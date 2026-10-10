@@ -163,6 +163,28 @@ test("CLI client exposes Telegram parity management APIs", async () => {
   } finally { globalThis.fetch = original; }
 });
 
+test("CLI client exposes mission, context, department, outcome, and automation controls", async () => {
+  const original = globalThis.fetch;
+  const calls: { path: string; method: string }[] = [];
+  globalThis.fetch = (async (input, init) => {
+    const request = new Request(input, init);
+    calls.push({ path: new URL(request.url).pathname, method: request.method });
+    return response({ ok: true, missions: [], context: [], departments: [], outcomes: [], events: [], proof: {}, plan: {}, mission: {}, department: {}, handoff: {} });
+  }) as typeof fetch;
+  try {
+    const client = new ChuskyClient({ serverUrl: "https://example.test", token: "token" });
+    await client.missions(); await client.mission("m 1"); await client.missionAction("m 1", "pause");
+    await client.context({ query: "priority" }); await client.saveContext({ scope: "personal", kind: "fact", key: "x", value: "y", confidence: 1, sensitivity: "normal", tags: [] });
+    await client.departmentCatalog(); await client.departments(); await client.departmentHandoff("sales", { objective: "qualify" });
+    await client.outcomes(); await client.planOutcome("sales", {}); await client.reminderAction("r 1", "pause"); await client.jobAction("j 1", "run");
+    assert.deepEqual(calls.map((call) => call.path), [
+      "/cli/missions", "/cli/missions/m%201", "/cli/missions/m%201/action",
+      "/cli/context", "/cli/context", "/cli/departments/catalog", "/cli/departments", "/cli/departments/sales/handoffs",
+      "/cli/outcomes", "/cli/outcomes/sales/plan", "/cli/reminders/r%201", "/cli/jobs/j%201",
+    ]);
+  } finally { globalThis.fetch = original; }
+});
+
 test("CLI client exposes meeting preparation, participant context, and lifecycle APIs", async () => {
   const original = globalThis.fetch;
   const calls: { path: string; method: string; body?: unknown }[] = [];

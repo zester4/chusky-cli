@@ -23,6 +23,17 @@ revoke the terminal remotely when reachable and always remove its local
 credential. Tool activity is shown as compact, human-readable progress lines;
 the notification stream reconnects automatically after a dropped connection.
 
+For dashboard-generated credentials, link directly without a Telegram code:
+
+```bash
+chusky auth link --server https://chusky.up.railway.app --token chusky_<token>
+```
+
+Mission and coordination controls are available from chat with `/missions`,
+`/mission`, `/context`, `/departments`, and `/outcomes`. Reminder and recurring
+job controls support `/reminders pause|resume|run|cancel <id>` and
+`/jobs pause|resume|run|cancel <id>`.
+
 Use `chusky help` for commands. Meeting controls, calendars, participant
 context, voice selection, connected apps, triggers, tasks, reminders, files,
 workers, approvals, and durable runs are available through the same account

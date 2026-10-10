@@ -19,8 +19,19 @@ function arg(name: string): string | undefined {
 async function pair(): Promise<void> {
   const current = await loadCliConfig();
   const serverUrl = arg("--server") || current.serverUrl || (await prompt("Chusky server URL: ")).trim();
-  const code = arg("--code") || (await prompt("Telegram pairing code: ")).trim();
+  const directToken = arg("--token")?.trim();
+  const pairingCode = arg("--code")?.trim();
+  if (directToken && pairingCode) throw new Error("Use either --token or --code, not both.");
   const deviceName = arg("--name") || `${process.env.COMPUTERNAME || process.env.HOSTNAME || "terminal"}`;
+  if (directToken) {
+    if (!/^chusky_[A-Za-z0-9_-]{20,200}$/.test(directToken)) throw new Error("Invalid CLI token format.");
+    const session = await new ChuskyClient({ serverUrl, token: directToken }).session();
+    if (!session.ok) throw new Error(session.error || "The CLI token could not be verified.");
+    await saveCliConfig({ serverUrl, token: directToken, deviceName: session.device || deviceName });
+    console.log(`Linked successfully as ${session.device || deviceName}. Configured durable Chusky session for user ${session.userId}.`);
+    return;
+  }
+  const code = pairingCode || (await prompt("Telegram pairing code: ")).trim();
   const response = await new ChuskyClient({ serverUrl }).pair(code, deviceName);
   if (!response.ok || typeof response.token !== "string") throw new Error(response.error || "Pairing failed");
   await saveCliConfig({ serverUrl, token: response.token, deviceName });
@@ -66,6 +77,25 @@ function autonomyLine(item: any, color: boolean): string {
   const state = item.blockedReason ? "blocked" : item.status;
   const tone = state === "blocked" ? "yellow" : state === "completed" ? "green" : "cyan";
   return `${paint(String(item.id), "dim", color)}  ${paint(`[${state}]`, tone as "yellow" | "green" | "cyan", color)}  ${item.title}${item.nextAction ? ` — ${item.nextAction}` : ""}`;
+}
+
+function missionLine(mission: any, color: boolean): string {
+  const statusColor = mission.status === "completed" ? "green" : ["failed", "cancelled"].includes(mission.status) ? "red" : ["paused", "blocked", "waiting"].includes(mission.status) ? "yellow" : "cyan";
+  const active = Array.isArray(mission.activeStepIds) && mission.activeStepIds.length ? ` · ${mission.activeStepIds.length} active step${mission.activeStepIds.length === 1 ? "" : "s"}` : "";
+  return `${paint(String(mission.id), "dim", color)}  ${paint(`[${mission.status}]`, statusColor as "green" | "red" | "yellow" | "cyan", color)}  ${mission.title}${active}`;
+}
+
+function missionDetail(mission: any, color: boolean): string {
+  const lines = [missionLine(mission, color), `Objective: ${mission.objective}`, `Definition of done: ${mission.definitionOfDone}`, `Next action: ${mission.nextAction || "not set"}`, `Checkpoint: ${mission.checkpoint || "none"}`, `Budget: ${mission.consumedSteps}/${mission.budget?.maxSteps ?? "?"} steps · ${mission.toolCalls}/${mission.budget?.maxToolCalls ?? "?"} tools · $${Number(mission.cost || 0).toFixed(4)}/${mission.budget?.maxCost ?? "?"}`];
+  if (mission.waiting) lines.push(`Waiting: ${JSON.stringify(mission.waiting)}`);
+  if (Array.isArray(mission.steps)) lines.push(`\nSteps:\n${mission.steps.map((step: any) => `- ${step.id} [${step.status}] ${step.title}${step.dependsOn?.length ? ` (after ${step.dependsOn.join(", ")})` : ""}${step.result ? `\n  ${step.result}` : ""}`).join("\n")}`);
+  if (mission.verification) lines.push(`\nVerification: ${mission.verification.verified ? "verified" : "not verified"}${mission.verification.unresolved?.length ? ` — ${mission.verification.unresolved.join("; ")}` : ""}`);
+  if (mission.error) lines.push(`Error: ${mission.error}`);
+  return lines.join("\n");
+}
+
+function parseJson<T>(value: string, usage: string): T {
+  try { return JSON.parse(value) as T; } catch { throw new Error(`Invalid JSON. Usage: ${usage}`); }
 }
 
 function meetingLine(meeting: any, color: boolean): string {
@@ -438,6 +468,26 @@ async function chat(): Promise<void> {
         else console.log(formatError("Usage: /run <prompt> [5m|30m|1h|3h|6h|3d|1w] | /run status|events|cancel|resume <id>", color));
         continue;
       }
+      if (line === "/missions" || line.startsWith("/missions ")) {
+        const id = line.slice("/missions".length).trim();
+        const result = id ? await client.mission(id) : await client.missions();
+        if (!result.ok) console.log(formatError(result.error || "Could not load missions.", color));
+        else if (id) await showPaged(result.mission ? missionDetail(result.mission, color) : "Mission not found.", true);
+        else { const missions = (result.missions as any[] | undefined) ?? []; await showPaged(missions.length ? missions.map((mission) => missionLine(mission, color)).join("\n") : "No autonomous missions.", true); }
+        continue;
+      }
+      if (line === "/mission" || line.startsWith("/mission ")) {
+        const raw = line.slice("/mission".length).trim(); const parts = raw.split(/\s+/).filter(Boolean); const action = parts.shift()?.toLowerCase() || "list";
+        if (action === "list") { const result = await client.missions(); console.log(result.ok ? result.missions?.map((mission) => missionLine(mission, color)).join("\n") || "No autonomous missions." : formatError(result.error || "Could not load missions.", color)); }
+        else if (action === "create") { const fields = raw.slice("create".length).trim().split("|").map((value) => value.trim()); if (!fields[0] || !fields[1] || !fields[2]) console.log(formatError("Usage: /mission create <title> | <objective> | <definition of done>", color)); else { const result = await client.createMission({ title: fields[0], objective: fields[1], definitionOfDone: fields[2] }); console.log(result.ok ? formatSuccess(`Mission started: ${result.mission?.id || "queued"}.`, color) : formatError(result.error || "Mission could not be created.", color)); } }
+        else if (["pause", "resume", "cancel", "repair"].includes(action)) { const id = parts[0]; if (!id) console.log(formatError(`Usage: /mission ${action} <id>`, color)); else { const result = await client.missionAction(id, action as "pause" | "resume" | "cancel" | "repair"); console.log(result.ok ? formatSuccess(`Mission ${action} requested: ${id}.`, color) : formatError(result.error || `Mission could not be ${action}d.`, color)); } }
+        else if (["doctor", "proof", "events"].includes(action)) { const id = parts[0]; if (!id) console.log(formatError(`Usage: /mission ${action} <id>`, color)); else if (action === "doctor") { const result = await client.missionDoctor(id); console.log(result.ok ? JSON.stringify(result.doctor, null, 2) : formatError(result.error || "Mission diagnosis is unavailable.", color)); } else if (action === "proof") { const result = await client.missionProof(id); console.log(result.ok ? JSON.stringify(result.proof, null, 2) : formatError(result.error || "Mission proof is unavailable.", color)); } else { const result = await client.missionEvents(id); await showPaged(result.ok ? result.events?.map((event) => `${new Date(event.at).toISOString()}  ${event.type}: ${event.message}`).join("\n") || "No mission events." : formatError(result.error || "Mission events are unavailable.", color), true); } }
+        else console.log(formatError("Usage: /missions [id] | /mission list|create|pause|resume|cancel|repair|doctor|proof|events ...", color));
+        continue;
+      }
+      if (line === "/context" || line.startsWith("/context ")) { const raw = line.slice("/context".length).trim(); try { const result = raw.toLowerCase().startsWith("save ") ? await client.saveContext(parseJson<any>(raw.slice(5).trim(), "/context save <context JSON>")) : await client.context(raw ? { query: raw } : {}); if (!result.ok) console.log(formatError(result.error || "Context operation failed.", color)); else { const nodes = Array.isArray(result.context) ? result.context : []; await showPaged(nodes.length ? nodes.map((node) => `[${node.scope}/${node.kind}] ${node.key}: ${node.value}`).join("\n") : "No matching context.", true); } } catch (error) { console.log(formatError(error instanceof Error ? error.message : String(error), color)); } continue; }
+      if (line === "/departments" || line.startsWith("/departments ")) { const raw = line.slice("/departments".length).trim(); const parts = raw.split(/\s+/).filter(Boolean); const action = parts.shift() || "list"; if (action === "catalog") { const result = await client.departmentCatalog(); await showPaged(result.ok ? result.departments.map((department) => `${department.slug} — ${department.name} (${department.worker})\n${department.objective}`).join("\n\n") : formatError(result.error || "Could not load department catalogue.", color), true); } else if (action === "provision" && parts[0]) { const result = await client.provisionDepartment({ department: parts[0] }); console.log(result.ok ? formatSuccess(`Department provisioned: ${result.department?.name || parts[0]}.`, color) : formatError(result.error || "Department could not be provisioned.", color)); } else if (action === "handoff" && parts.length >= 2) { const result = await client.departmentHandoff(parts.shift()!, { objective: parts.join(" ") }); console.log(result.ok ? formatSuccess(`Handoff created: ${result.handoff?.id || "queued"}.`, color) : formatError(result.error || "Handoff could not be created.", color)); } else { const result = await client.departments(); await showPaged(result.ok ? result.departments.map((department) => `${department.id}  ${department.name} [${department.department}]`).join("\n") || "No department spaces." : formatError(result.error || "Could not load departments.", color), true); } continue; }
+      if (line === "/outcomes" || line.startsWith("/outcomes ")) { const raw = line.slice("/outcomes".length).trim(); const parts = raw.split(/\s+/).filter(Boolean); const action = parts.shift() || "list"; if (action === "list") { const result = await client.outcomes(); await showPaged(result.ok ? result.outcomes.map((outcome) => `${outcome.slug} — ${outcome.name}\n${outcome.description}`).join("\n\n") || "No outcome packages." : formatError(result.error || "Could not load outcomes.", color), true); } else if (action === "plan" && parts[0]) { try { const result = await client.planOutcome(parts[0], parseJson<Record<string, unknown>>(parts.slice(1).join(" ") || "{}", "/outcomes plan <slug> <JSON>")); console.log(result.ok ? JSON.stringify(result.plan, null, 2) : formatError(result.error || "Outcome could not be planned.", color)); } catch (error) { console.log(formatError(error instanceof Error ? error.message : String(error), color)); } } else { const result = await client.outcome(action); console.log(result.ok ? JSON.stringify(result.outcome, null, 2) : formatError(result.error || "Outcome not found.", color)); } continue; }
       if (line === "/webhooks") { const result = await client.webhooks(); console.log(result.ok ? (result.webhooks?.map((hook) => `${hook.id}  [${hook.disabledAt ? "disabled" : "enabled"}]  ${hook.url}`).join("\n") || "No webhooks.") : formatError(result.error || "Could not load webhooks.", color)); continue; }
       if (line.startsWith("/webhook ")) { const parts = line.slice("/webhook ".length).trim().split(/\s+/); const action = parts.shift() || ""; const id = parts.shift(); let result: any; if (action === "add" && id) result = await client.createWebhook(id); else if (["enable", "disable"].includes(action) && id) result = await client.setWebhook(id, action === "enable"); else if (action === "delete" && id) result = await client.deleteWebhook(id); else { console.log(formatError("Usage: /webhook add <https-url> | enable|disable|delete <id>", color)); continue; } console.log(result.ok ? formatSuccess(action === "add" ? `Webhook created${result.secret ? `; secret: ${result.secret}` : ""}.` : `Webhook ${action} completed.`, color) : formatError(result.error || "Webhook operation failed.", color)); continue; }
       if (line === "/deliveries") { const result = await client.deliveries(); console.log(result.ok ? (result.deliveries?.map((delivery) => `${delivery.id}  [${delivery.status}]  ${delivery.provider}  ${delivery.kind}${delivery.lastError ? ` — ${delivery.lastError}` : ""}`).join("\n") || "No deliveries.") : formatError(result.error || "Could not load deliveries.", color)); continue; }
@@ -489,6 +539,8 @@ async function chat(): Promise<void> {
         } catch (error) { console.log(formatError(error instanceof Error ? error.message : String(error), color)); }
         continue;
       }
+      const automationCommand = line.match(/^\/(reminders|jobs)\s+(pause|resume|run|cancel)\s+(\S+)$/);
+      if (automationCommand) { const [, kind, action, id] = automationCommand; const result = kind === "reminders" ? await client.reminderAction(id, action as "pause" | "resume" | "run" | "cancel") : await client.jobAction(id, action as "pause" | "resume" | "run" | "cancel"); console.log(result.ok ? formatSuccess(`${kind === "reminders" ? "Reminder" : "Job"} ${action} requested.`, color) : formatError(result.error || "Automation action failed.", color)); continue; }
       if (["/status", "/memory", "/scratchpad", "/reminders", "/jobs"].includes(line) || line.startsWith("/memory ") || line.startsWith("/scratchpad ")) {
         if (line === "/status") {
           const current = await client.session();
@@ -599,7 +651,7 @@ async function main(): Promise<void> {
   else if (command === "chat") await chat();
   else if (command === "devices") await devicesCommand();
   else if (command === "revoke") await devicesCommand(process.argv.slice(3).join(" ").trim());
-  else if (command === "help" || command === "--help" || command === "-h") console.log("chusky setup | doctor | chat | auth link | auth status | auth logout | devices | revoke <name>");
+  else if (command === "help" || command === "--help" || command === "-h") console.log("chusky setup | doctor | chat | auth link [--token <token> | --code <code>] | auth status | auth logout | devices | revoke <name>");
   else throw new Error(`Unknown command: ${command}`);
 }
 
