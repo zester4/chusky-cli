@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { cliSecretBackend, loadCliSecret, saveCliSecret } from "./secrets.js";
+import { cliSecretBackend, deleteCliSecret, loadCliSecret, saveCliSecret } from "./secrets.js";
 
 export interface CliConfig { serverUrl: string; token?: string; deviceName?: string; color?: boolean; }
 export interface CliSession {
@@ -56,7 +56,8 @@ export interface CliVideoJob { id: string; prompt: string; destination: "telegra
 export interface CliRun { id: string; threadId?: string; taskId?: string; status: string; input: string; model?: string; output?: string; budget?: Record<string, unknown>; error?: { code: string; message: string }; events?: { id: string; type: string; at: number; text?: string }[]; createdAt: string; updatedAt: string; }
 export interface CliWebhook { id: string; url: string; createdAt: string; disabledAt?: string; }
 export interface CliDelivery { id: string; provider: string; status: string; kind: string; attempts: number; providerStatus?: string; lastError?: string; createdAt: string; updatedAt: string; deliveredAt?: string; }
-export type CliStreamEvent = { type: "start" | "delta" | "done" | "approval_required" | "error"; text?: string; error?: string; model?: string; toolsUsed?: string[]; cost?: number; approval?: { id: string; toolSlug: string; args: Record<string, unknown> }; images?: { data: string; mediaType: string }[]; files?: CliGeneratedFile[]; speech?: { data: string; mediaType: string } };
+export type CliToolActivity = { toolSlug: string; status: "started" | "completed" | "failed" | "approval_required" | "cancelled"; message?: string; summary?: string; durationMs?: number; actionLabel?: string; toolkitName?: string };
+export type CliStreamEvent = { type: "start" | "delta" | "tool" | "done" | "approval_required" | "error"; text?: string; error?: string; model?: string; toolsUsed?: string[]; cost?: number; tool?: CliToolActivity; approval?: { id: string; toolSlug: string; args: Record<string, unknown> }; images?: { data: string; mediaType: string }[]; files?: CliGeneratedFile[]; speech?: { data: string; mediaType: string } };
 
 const configPath = process.platform === "win32"
   ? join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Chusky", "config.json")
@@ -81,6 +82,7 @@ export async function saveCliConfig(config: CliConfig): Promise<void> {
   await mkdir(dirname(configPath), { recursive: true });
   const { token, ...publicConfig } = config;
   const stored = token && config.serverUrl ? await saveCliSecret(configPath, config.serverUrl, token) : false;
+  if (!token && config.serverUrl) await deleteCliSecret(configPath, config.serverUrl);
   await writeFile(configPath, JSON.stringify(stored ? publicConfig : config, null, 2), { encoding: "utf8", mode: 0o600 });
 }
 
@@ -157,24 +159,39 @@ export class ChuskyClient {
   collection(kind: "history" | "memories" | "scratchpad" | "reminders" | "jobs", page = 1, pageSize = 25, query = "") { return this.request(`/cli/collection/${kind}?page=${Math.max(1, Math.floor(page))}&pageSize=${Math.max(1, Math.floor(pageSize))}&query=${encodeURIComponent(query)}`) as Promise<CliCollectionResponse>; }
   async *eventStream(since = 0, signal?: AbortSignal): AsyncGenerator<CliEventsResponse> {
     if (!this.config.serverUrl) throw new Error("Set CHUSKY_SERVER_URL or run: chusky auth link --server https://your-chusky-host");
-    const headers = new Headers({ Accept: "text/event-stream" }); if (this.config.token) headers.set("Authorization", `Bearer ${this.config.token}`);
-    const response = await fetch(`${this.config.serverUrl.replace(/\/$/, "")}/cli/events/stream?since=${Math.max(0, Math.floor(since))}`, { headers, signal: signal ?? AbortSignal.timeout(30 * 60_000) });
-    if (!response.ok) { const data = await response.json().catch(() => ({})) as CliResponse; throw new Error(data.error || `HTTP ${response.status}`); }
-    if (!response.body) throw new Error("Chusky returned an empty event stream");
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let data = ""; let eventName = "message";
-    while (true) {
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-      const blocks = buffer.split("\n\n"); buffer = blocks.pop() ?? "";
-      for (const block of blocks) {
-        for (const line of block.split("\n")) {
-          if (line.startsWith("event: ")) eventName = line.slice(7);
-          if (line.startsWith("data: ")) data += line.slice(6);
+    let cursor = Math.max(0, Math.floor(since));
+    let delay = 1000;
+    while (!signal?.aborted) {
+      const headers = new Headers({ Accept: "text/event-stream" }); if (this.config.token) headers.set("Authorization", `Bearer ${this.config.token}`);
+      try {
+        const response = await fetch(`${this.config.serverUrl.replace(/\/$/, "")}/cli/events/stream?since=${cursor}`, { headers, signal: signal ?? AbortSignal.timeout(30 * 60_000) });
+        if (!response.ok) { const data = await response.json().catch(() => ({})) as CliResponse; throw new Error(data.error || `HTTP ${response.status}`); }
+        if (!response.body) throw new Error("Chusky returned an empty event stream");
+        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let data = ""; let eventName = "message";
+        while (true) {
+          const { done, value } = await reader.read();
+          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const blocks = buffer.split("\n\n"); buffer = blocks.pop() ?? "";
+          for (const block of blocks) {
+            for (const line of block.split("\n")) {
+              if (line.startsWith("event: ")) eventName = line.slice(7);
+              if (line.startsWith("data: ")) data += line.slice(6);
+            }
+            if (data && eventName === "notification") {
+              const event = JSON.parse(data) as CliEventsResponse;
+              cursor = Math.max(cursor, Math.floor(event.now || Date.now()));
+              yield event;
+            }
+            data = ""; eventName = "message";
+          }
+          if (done) break;
         }
-        if (data && eventName === "notification") { yield JSON.parse(data) as CliEventsResponse; }
-        data = ""; eventName = "message";
+        delay = 1000;
+      } catch (error) {
+        if (signal?.aborted) return;
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        delay = Math.min(delay * 2, 30_000);
       }
-      if (done) break;
     }
   }
   async media(file: Blob, filename: string, message = "", signal?: AbortSignal): Promise<CliResponse> {

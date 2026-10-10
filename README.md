@@ -17,6 +17,12 @@ In Telegram, send `/cli link` to generate a one-time pairing code. The CLI
 stores the resulting device token in the operating system credential store
 (with an encrypted-file fallback when a keychain is unavailable).
 
+Use `chusky auth status` to inspect the linked server, device, owner, and local
+secret-storage backend without printing the token. Use `chusky auth logout` to
+revoke the terminal remotely when reachable and always remove its local
+credential. Tool activity is shown as compact, human-readable progress lines;
+the notification stream reconnects automatically after a dropped connection.
+
 Use `chusky help` for commands. Meeting controls, calendars, participant
 context, voice selection, connected apps, triggers, tasks, reminders, files,
 workers, approvals, and durable runs are available through the same account
